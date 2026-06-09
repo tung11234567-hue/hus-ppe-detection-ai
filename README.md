@@ -35,3 +35,4 @@ Framework: Ultralytics
 Dataset format: YOLOv8 / Ultralytics YOLO
 Dataset gốc: 16 class, convert về 5 class
 Best mAP50 hiện tại: 0.725
+"@ | Set-Content -Path README.md -Encoding UTF8
