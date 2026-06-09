@@ -1,0 +1,20 @@
+model:
+  weights: weights/best.pt
+  fallback_pretrained: yolo11n.pt
+  confidence: 0.35
+  iou: 0.50
+  image_size: 640
+
+rules:
+  head_zone_ratio: 0.45
+  torso_y1_ratio: 0.25
+  torso_y2_ratio: 0.85
+  min_overlap_ratio: 0.05
+  require_person_detection: true
+
+classes:
+  person_aliases: [person, human, Human, worker, employee]
+  helmet_aliases: [helmet, Helmet, hat, hardhat, hard_hat, safety_helmet, mu_bao_ho]
+  vest_aliases: [vest, safety_vest, Safety Vest, reflective_vest, high_vis_vest, ao_phan_quang]
+  no_helmet_aliases: [no_helmet, no_hat, no hat, no-helmet, no_hardhat, no-hardhat, without_helmet]
+  no_vest_aliases: [no_vest, no vest, no-vest, no_safety_vest, no-safety-vest, without_vest]
