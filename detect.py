@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-width", type=int, default=1280, help="Max preview window width")
     parser.add_argument("--view-height", type=int, default=720, help="Max preview window height")
     parser.add_argument("--no-video-fix", action="store_true", help="Disable video metadata correction")
+    parser.add_argument("--tracker", default="iou", help="Tracker type. Current stable option: iou")
+    parser.add_argument("--no-tracking", action="store_true", help="Disable person ID tracking")
     return parser.parse_args()
 
 
@@ -243,16 +245,20 @@ def scale_statuses(statuses: list[PersonPPEStatus], scale: float, x_offset: int,
         scaled_vest = _scale_detection(status.matched_vest, scale, x_offset, y_offset)
         if scaled_person is None:
             continue
-        scaled_statuses.append(
-            PersonPPEStatus(
-                person=scaled_person,
-                helmet_ok=status.helmet_ok,
-                vest_ok=status.vest_ok,
-                violations=list(status.violations),
-                matched_helmet=scaled_helmet,
-                matched_vest=scaled_vest,
-            )
+        scaled_status = PersonPPEStatus(
+            person=scaled_person,
+            helmet_ok=status.helmet_ok,
+            vest_ok=status.vest_ok,
+            violations=list(status.violations),
+            matched_helmet=scaled_helmet,
+            matched_vest=scaled_vest,
         )
+        if hasattr(status, "person_id"):
+            try:
+                setattr(scaled_status, "person_id", int(getattr(status, "person_id")))
+            except Exception:
+                pass
+        scaled_statuses.append(scaled_status)
     return scaled_statuses
 
 
@@ -282,6 +288,120 @@ def draw_fixed_dashboard(image: np.ndarray, statuses: list[PersonPPEStatus]) -> 
     cv2.putText(image, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
+
+# =========================
+# SIMPLE PERSON TRACKING
+# =========================
+
+def _box_iou(a, b) -> float:
+    ax1, ay1, ax2, ay2 = map(float, a)
+    bx1, by1, bx2, by2 = map(float, b)
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+
+    return inter / union if union > 0 else 0.0
+
+
+class SimplePersonTracker:
+    """
+    Tracker nhẹ dựa trên IoU giữa box person qua các frame.
+    Không gọi model.track(), không chạy YOLO lần 2, nên không làm giảm detection chính.
+    """
+
+    def __init__(self, iou_threshold: float = 0.20, max_missed: int = 20):
+        self.iou_threshold = float(iou_threshold)
+        self.max_missed = int(max_missed)
+        self.next_id = 1
+        self.tracks: dict[int, dict[str, Any]] = {}
+
+    def reset(self) -> None:
+        self.next_id = 1
+        self.tracks.clear()
+
+    def update(self, boxes: list[tuple[float, float, float, float]]) -> list[int]:
+        boxes = [tuple(float(v) for v in box) for box in boxes]
+        assigned_ids: list[int | None] = [None] * len(boxes)
+
+        candidates: list[tuple[float, int, int]] = []
+        for det_idx, box in enumerate(boxes):
+            for track_id, info in self.tracks.items():
+                iou = _box_iou(box, info["box"])
+                if iou >= self.iou_threshold:
+                    candidates.append((iou, det_idx, track_id))
+
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        used_dets: set[int] = set()
+        used_tracks: set[int] = set()
+
+        for _iou, det_idx, track_id in candidates:
+            if det_idx in used_dets or track_id in used_tracks:
+                continue
+            assigned_ids[det_idx] = track_id
+            used_dets.add(det_idx)
+            used_tracks.add(track_id)
+
+        for det_idx, box in enumerate(boxes):
+            if assigned_ids[det_idx] is None:
+                assigned_ids[det_idx] = self.next_id
+                self.next_id += 1
+
+            track_id = int(assigned_ids[det_idx])
+            self.tracks[track_id] = {"box": box, "missed": 0}
+
+        for track_id in list(self.tracks.keys()):
+            if track_id not in set(int(x) for x in assigned_ids if x is not None):
+                self.tracks[track_id]["missed"] += 1
+                if self.tracks[track_id]["missed"] > self.max_missed:
+                    del self.tracks[track_id]
+
+        return [int(x) for x in assigned_ids if x is not None]
+
+
+def assign_person_ids(statuses: list[PersonPPEStatus], tracker: SimplePersonTracker | None = None) -> None:
+    """
+    Gắn person_id vào status.
+    - Có tracker: ID giữ tương đối ổn qua nhiều frame video.
+    - Không có tracker: ID tạm theo thứ tự trong 1 ảnh/frame.
+    """
+    if tracker is None:
+        ids = list(range(1, len(statuses) + 1))
+    else:
+        person_boxes = [s.person.xyxy for s in statuses]
+        ids = tracker.update(person_boxes)
+
+    for status, person_id in zip(statuses, ids):
+        try:
+            setattr(status, "person_id", int(person_id))
+        except Exception:
+            pass
+
+
+def draw_person_ids(image: np.ndarray, statuses: list[PersonPPEStatus]) -> None:
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    for idx, status in enumerate(statuses, start=1):
+        person_id = int(getattr(status, "person_id", idx))
+        x1, y1, x2, y2 = map(int, status.person.xyxy)
+        text_status = "SAFE" if not status.violations else "+".join(status.violations)
+        text = f"ID {person_id} | {text_status}"
+        color = (0, 200, 0) if not status.violations else (0, 0, 255)
+
+        (tw, th), baseline = cv2.getTextSize(text, font, 0.72, 2)
+        yy = max(24, y1 - 8)
+        cv2.rectangle(image, (x1, yy - th - 8), (x1 + tw + 10, yy + baseline), color, -1)
+        cv2.putText(image, text, (x1 + 5, yy - 4), font, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+
 def _init_view_window() -> None:
     try:
         cv2.namedWindow(VIEW_WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
@@ -295,6 +415,8 @@ def detect_on_frame(
     cfg,
     use_canvas: bool = True,
     show_dashboard: bool = True,
+    tracker: SimplePersonTracker | None = None,
+    show_person_ids: bool = True,
 ) -> tuple[np.ndarray, list[Detection], list[PersonPPEStatus], dict[str, int]]:
     """
     Hàm AI chung cho cả detect.py và app_streamlit.py.
@@ -305,8 +427,13 @@ def detect_on_frame(
     statuses = analyze_ppe(detections, cfg)
     counts = summary_counts(statuses)
 
+    if show_person_ids:
+        assign_person_ids(statuses, tracker)
+
     if not use_canvas:
         annotated = draw_ppe_status(frame_bgr, detections, statuses)
+        if show_person_ids:
+            draw_person_ids(annotated, statuses)
         return annotated, detections, statuses, counts
 
     canvas, scale, x_offset, y_offset = letterbox_to_canvas(frame_bgr, CANVAS_WIDTH, CANVAS_HEIGHT)
@@ -321,6 +448,8 @@ def detect_on_frame(
     )
     if show_dashboard:
         draw_fixed_dashboard(annotated, canvas_statuses)
+    if show_person_ids:
+        draw_person_ids(annotated, canvas_statuses)
 
     return annotated, detections, statuses, counts
 
@@ -330,8 +459,17 @@ def process_image_bgr(
     image_bgr: np.ndarray,
     cfg,
     use_canvas: bool = True,
+    show_person_ids: bool = True,
 ) -> tuple[np.ndarray, list[Detection], list[PersonPPEStatus], dict[str, int]]:
-    return detect_on_frame(detector, image_bgr, cfg, use_canvas=use_canvas, show_dashboard=True)
+    return detect_on_frame(
+        detector,
+        image_bgr,
+        cfg,
+        use_canvas=use_canvas,
+        show_dashboard=True,
+        tracker=None,
+        show_person_ids=show_person_ids,
+    )
 
 
 def process_image(
@@ -365,6 +503,7 @@ def process_video_to_path(
     max_seconds: int = 0,
     frame_skip: int = 1,
     fix_video: bool = True,
+    use_tracking: bool = True,
     progress_callback=None,
     preview_callback=None,
 ) -> dict[str, Any]:
@@ -405,6 +544,7 @@ def process_video_to_path(
     sum_counts = {"persons": 0, "safe": 0, "unsafe": 0, "no_helmet": 0, "no_vest": 0}
 
     start = time.time()
+    tracker = SimplePersonTracker() if use_tracking else None
 
     try:
         while True:
@@ -420,7 +560,15 @@ def process_video_to_path(
                 continue
 
             frame = _fix_video_frame(frame, video_meta) if fix_video else frame
-            annotated, detections, statuses, counts = detect_on_frame(detector, frame, cfg, use_canvas=True, show_dashboard=True)
+            annotated, detections, statuses, counts = detect_on_frame(
+                detector,
+                frame,
+                cfg,
+                use_canvas=True,
+                show_dashboard=True,
+                tracker=tracker,
+                show_person_ids=True,
+            )
 
             writer.write(annotated)
             processed += 1
@@ -463,6 +611,7 @@ def process_video(
     view_width: int = 1280,
     view_height: int = 720,
     fix_video: bool = True,
+    use_tracking: bool = True,
 ) -> Path:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     out_path = out_dir / f"ppe_video_{timestamp}.mp4"
@@ -492,6 +641,7 @@ def process_video(
         raise RuntimeError(f"Cannot create video writer: {out_path}")
 
     video_meta = _read_video_metadata(source) if fix_video else {}
+    tracker_state = SimplePersonTracker() if use_tracking else None
 
     try:
         while True:
@@ -500,7 +650,15 @@ def process_video(
                 break
 
             frame = _fix_video_frame(frame, video_meta) if fix_video else frame
-            annotated, _detections, _statuses, _counts = detect_on_frame(detector, frame, cfg, use_canvas=True, show_dashboard=True)
+            annotated, _detections, _statuses, _counts = detect_on_frame(
+                detector,
+                frame,
+                cfg,
+                use_canvas=True,
+                show_dashboard=True,
+                tracker=tracker_state,
+                show_person_ids=True,
+            )
             writer.write(annotated)
 
             if view:
@@ -552,6 +710,7 @@ def main() -> None:
             view_width=args.view_width,
             view_height=args.view_height,
             fix_video=not args.no_video_fix,
+            use_tracking=not args.no_tracking,
         )
         print(f"Saved: {out}")
 

@@ -148,7 +148,7 @@ def statuses_to_df(statuses) -> pd.DataFrame:
         x1, y1, x2, y2 = s.person.xyxy
         rows.append(
             {
-                "person": i,
+                "person_id": getattr(s, "person_id", i),
                 "status": "SAFE" if not s.violations else " + ".join(s.violations),
                 "helmet_ok": bool(s.helmet_ok),
                 "vest_ok": bool(s.vest_ok),
@@ -172,6 +172,7 @@ def build_json_result(detections, statuses, counts: dict[str, int]) -> str:
         ],
         "persons": [
             {
+                "person_id": getattr(s, "person_id", None),
                 "person_conf": float(s.person.conf),
                 "person_xyxy": [float(v) for v in s.person.xyxy],
                 "helmet_ok": bool(s.helmet_ok),
@@ -242,7 +243,7 @@ def process_uploaded_image(uploaded_file, weights_path: str, config_path: str, c
             detector,
             image_bgr,
             cfg,
-            use_canvas=True,
+            use_canvas=False,
         )
         elapsed = time.time() - start
 
@@ -292,6 +293,7 @@ def process_video_file(
     device: str | None,
     max_seconds: int,
     frame_skip: int,
+    use_tracking: bool,
 ) -> None:
     suffix = Path(uploaded_file.name).suffix or ".mp4"
 
@@ -326,6 +328,7 @@ def process_video_file(
             max_seconds=max_seconds,
             frame_skip=frame_skip,
             fix_video=True,
+            use_tracking=use_tracking,
             progress_callback=progress_callback,
             preview_callback=preview_callback,
         )
@@ -425,6 +428,7 @@ with st.sidebar:
     st.header("Video")
     max_seconds = st.slider("Giới hạn giây xử lý", 0, 300, 60, 10, help="0 = xử lý hết video.")
     frame_skip = st.slider("Frame skip", 1, 10, 1, 1, help="1 = xử lý mọi frame. 2 = cách 1 frame xử lý 1 frame.")
+    use_tracking = st.checkbox("Bật ID tracking", value=True, help="Dùng tracker IoU nhẹ, không gọi model.track nên không làm mất detection.")
 
 
 # =========================
@@ -474,6 +478,7 @@ with tab_video:
                     device,
                     max_seconds=max_seconds,
                     frame_skip=frame_skip,
+                    use_tracking=use_tracking,
                 )
             except Exception as exc:
                 st.error(f"Lỗi khi xử lý video: {exc}")
@@ -551,10 +556,13 @@ Thường để `0.45–0.50`.
 
 ---
 
-### 5. Code hiện tại có tracking thật chưa?
+### 5. Code hiện tại có tracking chưa?
 
-Không dùng tracking thật để tránh làm giảm/mất detection.
+Có. Bản này dùng tracker IoU nhẹ dựa trên box `person` đã detect được ở từng frame.
 
-Bản này ưu tiên nhận diện PPE ổn định. Nếu cần tracking thật, nên thêm sau và kiểm thử riêng.
+Cách này không gọi `model.track()` và không chạy YOLO lần 2, nên detection chính vẫn giữ nguyên từ `detector.predict_image(frame)`.
+
+- Video: ID cố gắng giữ ổn định qua các frame.
+- Ảnh/webcam chụp 1 frame: ID là số thứ tự tạm trong ảnh.
 """
     )

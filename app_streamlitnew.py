@@ -14,7 +14,7 @@ from PIL import Image
 
 from src.ppe_detector.config import load_rule_config
 from src.ppe_detector.model import PPEDetector
-from src.ppe_detector.rules import analyze_ppe, summary_counts
+from src.ppe_detector.rules import Detection, PersonPPEStatus, analyze_ppe, summary_counts
 from src.ppe_detector.visualize import draw_ppe_status
 
 
@@ -159,6 +159,180 @@ def get_detector(weights_path: str, conf: float, iou: float, device: str | None)
     return detector
 
 
+
+# =========================
+# PERSON ID / TRACKING HELPERS
+# =========================
+
+PPE_CLASS_NAMES = {
+    0: "person",
+    1: "helmet",
+    2: "safety_vest",
+    3: "no_helmet",
+    4: "no_vest",
+}
+
+
+def _get_yolo_model(detector: PPEDetector):
+    """Lấy model YOLO bên trong PPEDetector để gọi model.track()."""
+    for attr in ("model", "yolo", "_model"):
+        model = getattr(detector, attr, None)
+        if model is not None and hasattr(model, "track"):
+            return model
+    raise RuntimeError(
+        "Không tìm thấy YOLO model bên trong PPEDetector. "
+        "Mở src/ppe_detector/model.py kiểm tra object YOLO đang lưu ở thuộc tính nào "
+        "rồi thêm tên thuộc tính đó vào hàm _get_yolo_model()."
+    )
+
+
+def _box_iou(a, b) -> float:
+    ax1, ay1, ax2, ay2 = map(float, a)
+    bx1, by1, bx2, by2 = map(float, b)
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+
+    return inter / union if union > 0 else 0.0
+
+
+def _track_result_to_detections(result, conf_thres: float) -> tuple[list[Detection], list[tuple[tuple[float, float, float, float], int]]]:
+    detections: list[Detection] = []
+    person_tracks: list[tuple[tuple[float, float, float, float], int]] = []
+
+    if result.boxes is None:
+        return detections, person_tracks
+
+    boxes = result.boxes
+    xyxy = boxes.xyxy.cpu().numpy() if boxes.xyxy is not None else []
+    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else []
+    clss = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else []
+
+    ids = None
+    if hasattr(boxes, "id") and boxes.id is not None:
+        ids = boxes.id.cpu().numpy().astype(int)
+
+    for i in range(len(xyxy)):
+        conf = float(confs[i])
+        if conf < conf_thres:
+            continue
+
+        cls_id = int(clss[i])
+        cls_name = PPE_CLASS_NAMES.get(cls_id, str(cls_id))
+        box = tuple(float(v) for v in xyxy[i])
+
+        detections.append(
+            Detection(
+                cls_name=cls_name,
+                conf=conf,
+                xyxy=box,
+            )
+        )
+
+        if cls_id == 0 and ids is not None and i < len(ids):
+            person_tracks.append((box, int(ids[i])))
+
+    return detections, person_tracks
+
+
+def _track_person_ids(detector: PPEDetector, frame: np.ndarray, tracker: str = "bytetrack.yaml") -> list[tuple[tuple[float, float, float, float], int]]:
+    """
+    Chỉ dùng tracker để lấy ID cho person.
+    Không dùng output tracker làm detection chính, để tránh mất person/helmet/vest.
+    Detection chính vẫn dùng detector.predict_image(frame) như app cũ.
+    """
+    try:
+        model = _get_yolo_model(detector)
+
+        kwargs = {
+            "source": frame,
+            "conf": max(0.01, float(detector.conf)),
+            "iou": detector.iou,
+            "persist": True,
+            "tracker": tracker,
+            "verbose": False,
+            "classes": [0],
+        }
+
+        device = getattr(detector, "device", None)
+        if device is not None:
+            kwargs["device"] = device
+
+        results = model.track(**kwargs)
+
+        if not results or results[0].boxes is None:
+            return []
+
+        boxes = results[0].boxes
+        if boxes.xyxy is None or boxes.id is None:
+            return []
+
+        xyxy = boxes.xyxy.cpu().numpy()
+        ids = boxes.id.cpu().numpy().astype(int)
+
+        person_tracks = []
+        for box, tid in zip(xyxy, ids):
+            person_tracks.append((tuple(float(v) for v in box), int(tid)))
+
+        return person_tracks
+
+    except Exception:
+        return []
+
+
+def _status_text(status: PersonPPEStatus) -> str:
+    return "SAFE" if not status.violations else "+".join(status.violations)
+
+
+def _draw_person_ids(
+    image: np.ndarray,
+    statuses: list[PersonPPEStatus],
+    person_tracks: list[tuple[tuple[float, float, float, float], int]] | None = None,
+) -> None:
+    """
+    Vẽ ID cho từng person.
+    - Video: dùng track_id từ ByteTrack nếu có.
+    - Ảnh/webcam chụp 1 frame: dùng số thứ tự tạm.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    for idx, status in enumerate(statuses, start=1):
+        box = status.person.xyxy
+        x1, y1, x2, y2 = map(int, box)
+
+        person_id = idx
+        best_iou = 0.0
+
+        if person_tracks:
+            for track_box, track_id in person_tracks:
+                iou = _box_iou(box, track_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    person_id = track_id
+
+        try:
+            setattr(status, "person_id", int(person_id))
+        except Exception:
+            pass
+
+        text = f"ID {person_id} | {_status_text(status)}"
+        color = (0, 200, 0) if not status.violations else (0, 0, 255)
+
+        (tw, th), baseline = cv2.getTextSize(text, font, 0.72, 2)
+        yy = max(24, y1 - 8)
+        cv2.rectangle(image, (x1, yy - th - 8), (x1 + tw + 10, yy + baseline), color, -1)
+        cv2.putText(image, text, (x1 + 5, yy - 4), font, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+
 def detections_to_df(detections) -> pd.DataFrame:
     rows = []
     for i, d in enumerate(detections, start=1):
@@ -183,7 +357,7 @@ def statuses_to_df(statuses) -> pd.DataFrame:
         x1, y1, x2, y2 = s.person.xyxy
         rows.append(
             {
-                "person": i,
+                "person_id": getattr(s, "person_id", i),
                 "status": "SAFE" if not s.violations else " + ".join(s.violations),
                 "helmet_ok": bool(s.helmet_ok),
                 "vest_ok": bool(s.vest_ok),
@@ -207,6 +381,7 @@ def build_json_result(detections, statuses, counts: dict[str, int]) -> str:
         ],
         "persons": [
             {
+                "person_id": getattr(s, "person_id", None),
                 "person_conf": float(s.person.conf),
                 "person_xyxy": [float(v) for v in s.person.xyxy],
                 "helmet_ok": bool(s.helmet_ok),
@@ -243,6 +418,7 @@ def run_detection_on_bgr(
     statuses = analyze_ppe(detections, cfg)
     counts = summary_counts(statuses)
     annotated_bgr = draw_ppe_status(image_bgr, detections, statuses)
+    _draw_person_ids(annotated_bgr, statuses)
 
     return annotated_bgr, detections, statuses, counts
 
@@ -410,10 +586,15 @@ def process_video_file(
             if frame_idx % max(1, frame_skip) != 0:
                 continue
 
+            # Detection chính giữ nguyên logic cũ để không mất nhận diện person/helmet/vest.
             detections = detector.predict_image(frame)
             statuses = analyze_ppe(detections, cfg)
+
+            # Tracking chỉ lấy ID cho person, không thay thế detection.
+            person_tracks = _track_person_ids(detector, frame, tracker="bytetrack.yaml")
             counts = summary_counts(statuses)
             annotated = draw_ppe_status(frame, detections, statuses)
+            _draw_person_ids(annotated, statuses, person_tracks)
 
             writer.write(annotated)
 
@@ -669,7 +850,7 @@ Thường để `0.45–0.50`.
 
 ### 4. Code hiện tại có tracking chưa?
 
-Chưa. App hiện tại là detection + counting theo từng ảnh/frame.
-Muốn có tracking ID cần dùng `model.track(..., persist=True, tracker="bytetrack.yaml")`.
+Có. Với video, app dùng ByteTrack thông qua `model.track(..., persist=True, tracker="bytetrack.yaml")` để gán ID cho từng người qua nhiều frame.
+Với ảnh tĩnh hoặc ảnh chụp webcam, không có chuỗi thời gian nên app chỉ đánh số tạm `ID 1`, `ID 2`, ... cho các person trong ảnh.
 """
     )
