@@ -21,7 +21,7 @@ Mục tiêu của project là hỗ trợ giám sát an toàn lao động trong m
 |---|---|---|---|
 | 1 | Phạm Đức Anh | Viết báo cáo, làm slide | 25% |
 | 2 | Đặng Tùng Anh | Hỗ trợ code, train AI | 25% |
-| 3 | Nguyễn Hà Gia Bảo | Thiết kế code, web demo | 25% |
+| 3 | Nguyễn Hà Gia Bảo | Thiết kế code, thuyết trình | 25% |
 | 4 | Vũ Việt Anh | Viết báo cáo, làm slide | 25% |
 
 ## Bài toán
