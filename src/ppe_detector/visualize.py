@@ -161,49 +161,139 @@ def _draw_dashboard(
 
         y += line_h + gap_y
 
+import cv2
+import numpy as np
 
-def draw_ppe_status(
-    image: np.ndarray,
-    detections: List[Detection],
-    statuses: List[PersonPPEStatus],
-    show_dashboard: bool = True,
-) -> np.ndarray:
-    out = image.copy()
 
-    box_thin = _auto_thickness(out, base=1, max_thickness=4)
-    box_normal = _auto_thickness(out, base=2, max_thickness=6)
-    box_person = _auto_thickness(out, base=3, max_thickness=8)
+def _text_style(image):
+    h, w = image.shape[:2]
 
-    for d in detections:
-        class_name = d.cls_name.lower().replace(" ", "_")
+    # Font tự co theo kích thước ảnh, tránh lúc to lúc bé
+    scale = max(0.35, min(0.55, w / 2200))
+    thickness = 1 if w < 1400 else 2
 
-        if class_name not in {"person", "human", "worker", "employee"}:
-            x1, y1, x2, y2 = map(int, d.xyxy)
+    return scale, thickness
 
-            cv2.rectangle(out, (x1, y1), (x2, y2), YELLOW, box_thin)
-            draw_label(out, f"{d.cls_name} {d.conf:.2f}", x1, y1 - 4, YELLOW)
 
-    for status in statuses:
-        p = status.person
-        x1, y1, x2, y2 = map(int, p.xyxy)
+def _draw_label(image, text, x, y, color):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thickness = _text_style(image)
 
-        color = GREEN if not status.violations else RED
-        text = "SAFE" if not status.violations else " | ".join(status.violations)
+    x = max(0, int(x))
+    y = max(18, int(y))
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, box_person)
-        draw_label(out, f"{text} {p.conf:.2f}", x1, y1 - 8, color)
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
 
-        if status.matched_helmet is not None:
-            hx1, hy1, hx2, hy2 = map(int, status.matched_helmet.xyxy)
+    # Nếu label quá dài thì cắt ngắn
+    max_width = 180
+    if tw > max_width:
+        text = text[:18] + "..."
+        (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
 
-            cv2.rectangle(out, (hx1, hy1), (hx2, hy2), GREEN, box_normal)
+    cv2.rectangle(
+        image,
+        (x, y - th - 5),
+        (x + tw + 6, y + baseline + 2),
+        color,
+        -1,
+    )
 
-        if status.matched_vest is not None:
-            vx1, vy1, vx2, vy2 = map(int, status.matched_vest.xyxy)
+    cv2.putText(
+        image,
+        text,
+        (x + 3, y - 2),
+        font,
+        scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
 
-            cv2.rectangle(out, (vx1, vy1), (vx2, vy2), GREEN, box_normal)
 
+def _status_text(status):
+    if not status.violations:
+        return "SAFE"
+    return "+".join(status.violations)
+
+
+def draw_ppe_status(image, detections, statuses, show_dashboard=True):
+    """
+    Vẽ kết quả PPE gọn hơn:
+    - Person box: xanh nếu SAFE, đỏ nếu vi phạm
+    - Helmet/vest box: vàng, label nhỏ
+    - Không vẽ label quá to che ảnh
+    """
+
+    annotated = image.copy()
+
+    # Vẽ helmet / vest / no_helmet / no_vest trước
+    for det in detections:
+        name = str(det.cls_name)
+        norm = name.lower().replace(" ", "_")
+
+        if norm in ["person", "worker", "employee"]:
+            continue
+
+        x1, y1, x2, y2 = map(int, det.xyxy)
+
+        if norm in ["helmet", "hardhat", "hard_hat", "safety_helmet"]:
+            color = (0, 220, 255)      # vàng
+        elif norm in ["vest", "safety_vest", "reflective_vest", "high_vis_vest"]:
+            color = (0, 200, 255)      # vàng cam
+        elif norm in ["no_helmet", "no-helmet", "no_hardhat", "no-hardhat"]:
+            color = (0, 0, 255)        # đỏ
+        elif norm in ["no_vest", "no-vest", "no_safety_vest", "no-safety-vest"]:
+            color = (0, 80, 255)       # cam đỏ
+        else:
+            color = (180, 180, 180)
+
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 1)
+
+        label = f"{name} {float(det.conf):.2f}"
+        _draw_label(annotated, label, x1, y1 - 4, color)
+
+    # Vẽ person + trạng thái
+    for idx, status in enumerate(statuses, start=1):
+        x1, y1, x2, y2 = map(int, status.person.xyxy)
+
+        safe = not status.violations
+        color = (0, 180, 0) if safe else (0, 0, 255)
+
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+
+        person_id = getattr(status, "person_id", None)
+        if person_id is not None:
+            label = f"ID {person_id}"
+        else:
+            label = _status_text(status)
+
+        _draw_label(annotated, label, x1, y1 - 6, color)
+
+    # Dashboard nhỏ góc trên trái
     if show_dashboard:
-        _draw_dashboard(out, statuses)
+        persons = len(statuses)
+        unsafe = sum(bool(s.violations) for s in statuses)
+        safe = persons - unsafe
+        no_helmet = sum("NO_HELMET" in s.violations for s in statuses)
+        no_vest = sum("NO_VEST" in s.violations for s in statuses)
 
-    return out
+        text1 = f"Persons: {persons} | Safe: {safe} | Unsafe: {unsafe}"
+        text2 = f"No helmet: {no_helmet} | No vest: {no_vest}"
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale, thickness = _text_style(annotated)
+        scale = max(0.42, min(scale, 0.55))
+
+        x, y = 12, 25
+
+        (tw1, th1), _ = cv2.getTextSize(text1, font, scale, thickness)
+        (tw2, th2), _ = cv2.getTextSize(text2, font, scale, thickness)
+        box_w = max(tw1, tw2) + 18
+        box_h = th1 + th2 + 24
+
+        cv2.rectangle(annotated, (6, 6), (6 + box_w, 6 + box_h), (0, 0, 0), -1)
+
+        cv2.putText(annotated, text1, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.putText(annotated, text2, (x, y + th1 + 12), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return annotated

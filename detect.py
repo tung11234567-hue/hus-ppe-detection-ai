@@ -262,30 +262,60 @@ def scale_statuses(statuses: list[PersonPPEStatus], scale: float, x_offset: int,
     return scaled_statuses
 
 
-def draw_fixed_dashboard(image: np.ndarray, statuses: list[PersonPPEStatus]) -> None:
+def _draw_fixed_dashboard(image: np.ndarray, statuses: list[PersonPPEStatus]) -> None:
     counts = summary_counts(statuses)
+
     text = (
-        f"Persons: {counts['persons']} | "
-        f"Safe: {counts['safe']} | "
-        f"Unsafe: {counts['unsafe']} | "
-        f"No helmet: {counts['no_helmet']} | "
-        f"No vest: {counts['no_vest']}"
+        f"P:{counts['persons']}  "
+        f"S:{counts['safe']}  "
+        f"U:{counts['unsafe']}  "
+        f"H:{counts['no_helmet']}  "
+        f"V:{counts['no_vest']}"
     )
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.75
-    thickness = 2
-    x = 18
-    y = 38
-    pad_x = 12
-    pad_y = 10
-    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
-    box_x1 = x - pad_x
-    box_y1 = y - th - pad_y
-    box_x2 = x + tw + pad_x
-    box_y2 = y + baseline + pad_y
-    cv2.rectangle(image, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 0), -1)
-    cv2.putText(image, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    # Cố định tuyệt đối, không scale theo ảnh
+    font_scale = 0.45
+    thickness = 1
+
+    # Khung cố định
+    box_x1 = 8
+    box_y1 = 8
+    box_w = 260
+    box_h = 28
+
+    box_x2 = box_x1 + box_w
+    box_y2 = box_y1 + box_h
+
+    # Nền đen
+    cv2.rectangle(
+        image,
+        (box_x1, box_y1),
+        (box_x2, box_y2),
+        (0, 0, 0),
+        -1,
+    )
+
+    # Viền mỏng
+    cv2.rectangle(
+        image,
+        (box_x1, box_y1),
+        (box_x2, box_y2),
+        (80, 80, 80),
+        1,
+    )
+
+    cv2.putText(
+        image,
+        text,
+        (box_x1 + 8, box_y1 + 19),
+        font,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 
@@ -394,13 +424,35 @@ def draw_person_ids(image: np.ndarray, statuses: list[PersonPPEStatus]) -> None:
         person_id = int(getattr(status, "person_id", idx))
         x1, y1, x2, y2 = map(int, status.person.xyxy)
         text_status = "SAFE" if not status.violations else "+".join(status.violations)
-        text = f"ID {person_id} | {text_status}"
+        text = f"ID {person_id}"
         color = (0, 200, 0) if not status.violations else (0, 0, 255)
 
-        (tw, th), baseline = cv2.getTextSize(text, font, 0.72, 2)
-        yy = max(24, y1 - 8)
-        cv2.rectangle(image, (x1, yy - th - 8), (x1 + tw + 10, yy + baseline), color, -1)
-        cv2.putText(image, text, (x1 + 5, yy - 4), font, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+        font_scale = 0.38
+        thickness = 1
+
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+        yy = max(18, y1 - 4)
+        x1 = max(0, x1)
+
+        cv2.rectangle(
+            image,
+            (x1, yy - th - 5),
+            (x1 + tw + 6, yy + baseline + 2),
+            color,
+            -1,
+        )
+
+        cv2.putText(
+            image,
+            text,
+            (x1 + 3, yy - 2),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
 
 def _init_view_window() -> None:
     try:

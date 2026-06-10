@@ -395,7 +395,7 @@ with st.sidebar:
         "Confidence",
         min_value=0.01,
         max_value=0.95,
-        value=0.05,
+        value=0.25,
         step=0.01,
         help="Conf thấp thì ít bỏ sót hơn nhưng dễ nhận nhầm. Conf cao thì ít nhận nhầm hơn nhưng dễ bỏ sót.",
     )
