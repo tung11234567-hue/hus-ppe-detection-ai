@@ -12,10 +12,16 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from src.ppe_detector.config import load_rule_config
-from src.ppe_detector.model import PPEDetector
-from src.ppe_detector.rules import Detection, PersonPPEStatus, analyze_ppe, summary_counts
-from src.ppe_detector.visualize import draw_ppe_status
+# App Streamlit chỉ làm giao diện.
+# Toàn bộ logic detect/canvas/video dùng chung nằm trong detect.py.
+from detect import (
+    CANVAS_HEIGHT,
+    CANVAS_WIDTH,
+    create_detector,
+    load_rules_config_safe,
+    process_image_bgr,
+    process_video_to_path,
+)
 
 
 # =========================
@@ -63,39 +69,6 @@ st.markdown(
         margin-bottom: 0;
     }
 
-    .metric-card {
-        padding: 1rem;
-        border-radius: 18px;
-        background: rgba(15, 23, 42, 0.88);
-        border: 1px solid rgba(148, 163, 184, 0.22);
-        box-shadow: 0 12px 28px rgba(0,0,0,0.16);
-    }
-
-    .metric-label {
-        color: #94a3b8;
-        font-size: 0.85rem;
-        margin-bottom: 0.2rem;
-    }
-
-    .metric-value {
-        color: #f8fafc;
-        font-size: 2rem;
-        font-weight: 800;
-        line-height: 1.1;
-    }
-
-    .safe {
-        color: #22c55e;
-    }
-
-    .unsafe {
-        color: #ef4444;
-    }
-
-    .warn {
-        color: #f59e0b;
-    }
-
     .small-note {
         color: #94a3b8;
         font-size: 0.9rem;
@@ -118,7 +91,7 @@ st.markdown(
 
 
 # =========================
-# UTILS
+# UI UTILS
 # =========================
 
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp", "bmp"]
@@ -126,8 +99,8 @@ VIDEO_TYPES = ["mp4", "avi", "mov", "mkv", "webm"]
 
 
 @st.cache_resource(show_spinner=False)
-def load_detector_cached(weights_path: str, device_value: str | None) -> PPEDetector:
-    return PPEDetector(weights_path, conf=0.25, iou=0.50, device=device_value)
+def load_detector_cached(weights_path: str, conf: float, iou: float, device_value: str | None):
+    return create_detector(weights_path, conf=conf, iou=iou, device=device_value)
 
 
 @st.cache_data(show_spinner=False)
@@ -143,195 +116,13 @@ def rgb_to_bgr(image_rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
 
 
-def safe_load_cfg(config_path: str):
-    try:
-        return load_rule_config(config_path)
-    except Exception:
-        st.warning("Không đọc được config rules. App dùng rule mặc định.")
-        return load_rule_config(None)
-
-
-def get_detector(weights_path: str, conf: float, iou: float, device: str | None) -> PPEDetector:
-    detector = load_detector_cached(weights_path, device)
+def get_detector(weights_path: str, conf: float, iou: float, device: str | None):
+    detector = load_detector_cached(weights_path, conf, iou, device)
     detector.conf = conf
     detector.iou = iou
     detector.device = device
     return detector
 
-
-
-# =========================
-# PERSON ID / TRACKING HELPERS
-# =========================
-
-PPE_CLASS_NAMES = {
-    0: "person",
-    1: "helmet",
-    2: "safety_vest",
-    3: "no_helmet",
-    4: "no_vest",
-}
-
-
-def _get_yolo_model(detector: PPEDetector):
-    """Lấy model YOLO bên trong PPEDetector để gọi model.track()."""
-    for attr in ("model", "yolo", "_model"):
-        model = getattr(detector, attr, None)
-        if model is not None and hasattr(model, "track"):
-            return model
-    raise RuntimeError(
-        "Không tìm thấy YOLO model bên trong PPEDetector. "
-        "Mở src/ppe_detector/model.py kiểm tra object YOLO đang lưu ở thuộc tính nào "
-        "rồi thêm tên thuộc tính đó vào hàm _get_yolo_model()."
-    )
-
-
-def _box_iou(a, b) -> float:
-    ax1, ay1, ax2, ay2 = map(float, a)
-    bx1, by1, bx2, by2 = map(float, b)
-
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - inter
-
-    return inter / union if union > 0 else 0.0
-
-
-def _track_result_to_detections(result, conf_thres: float) -> tuple[list[Detection], list[tuple[tuple[float, float, float, float], int]]]:
-    detections: list[Detection] = []
-    person_tracks: list[tuple[tuple[float, float, float, float], int]] = []
-
-    if result.boxes is None:
-        return detections, person_tracks
-
-    boxes = result.boxes
-    xyxy = boxes.xyxy.cpu().numpy() if boxes.xyxy is not None else []
-    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else []
-    clss = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else []
-
-    ids = None
-    if hasattr(boxes, "id") and boxes.id is not None:
-        ids = boxes.id.cpu().numpy().astype(int)
-
-    for i in range(len(xyxy)):
-        conf = float(confs[i])
-        if conf < conf_thres:
-            continue
-
-        cls_id = int(clss[i])
-        cls_name = PPE_CLASS_NAMES.get(cls_id, str(cls_id))
-        box = tuple(float(v) for v in xyxy[i])
-
-        detections.append(
-            Detection(
-                cls_name=cls_name,
-                conf=conf,
-                xyxy=box,
-            )
-        )
-
-        if cls_id == 0 and ids is not None and i < len(ids):
-            person_tracks.append((box, int(ids[i])))
-
-    return detections, person_tracks
-
-
-def _track_person_ids(detector: PPEDetector, frame: np.ndarray, tracker: str = "bytetrack.yaml") -> list[tuple[tuple[float, float, float, float], int]]:
-    """
-    Chỉ dùng tracker để lấy ID cho person.
-    Không dùng output tracker làm detection chính, để tránh mất person/helmet/vest.
-    Detection chính vẫn dùng detector.predict_image(frame) như app cũ.
-    """
-    try:
-        model = _get_yolo_model(detector)
-
-        kwargs = {
-            "source": frame,
-            "conf": max(0.01, float(detector.conf)),
-            "iou": detector.iou,
-            "persist": True,
-            "tracker": tracker,
-            "verbose": False,
-            "classes": [0],
-        }
-
-        device = getattr(detector, "device", None)
-        if device is not None:
-            kwargs["device"] = device
-
-        results = model.track(**kwargs)
-
-        if not results or results[0].boxes is None:
-            return []
-
-        boxes = results[0].boxes
-        if boxes.xyxy is None or boxes.id is None:
-            return []
-
-        xyxy = boxes.xyxy.cpu().numpy()
-        ids = boxes.id.cpu().numpy().astype(int)
-
-        person_tracks = []
-        for box, tid in zip(xyxy, ids):
-            person_tracks.append((tuple(float(v) for v in box), int(tid)))
-
-        return person_tracks
-
-    except Exception:
-        return []
-
-
-def _status_text(status: PersonPPEStatus) -> str:
-    return "SAFE" if not status.violations else "+".join(status.violations)
-
-
-def _draw_person_ids(
-    image: np.ndarray,
-    statuses: list[PersonPPEStatus],
-    person_tracks: list[tuple[tuple[float, float, float, float], int]] | None = None,
-) -> None:
-    """
-    Vẽ ID cho từng person.
-    - Video: dùng track_id từ ByteTrack nếu có.
-    - Ảnh/webcam chụp 1 frame: dùng số thứ tự tạm.
-    """
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    for idx, status in enumerate(statuses, start=1):
-        box = status.person.xyxy
-        x1, y1, x2, y2 = map(int, box)
-
-        person_id = idx
-        best_iou = 0.0
-
-        if person_tracks:
-            for track_box, track_id in person_tracks:
-                iou = _box_iou(box, track_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    person_id = track_id
-
-        try:
-            setattr(status, "person_id", int(person_id))
-        except Exception:
-            pass
-
-        text = f"ID {person_id} | {_status_text(status)}"
-        color = (0, 200, 0) if not status.violations else (0, 0, 255)
-
-        (tw, th), baseline = cv2.getTextSize(text, font, 0.72, 2)
-        yy = max(24, y1 - 8)
-        cv2.rectangle(image, (x1, yy - th - 8), (x1 + tw + 10, yy + baseline), color, -1)
-        cv2.putText(image, text, (x1 + 5, yy - 4), font, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
 def detections_to_df(detections) -> pd.DataFrame:
     rows = []
@@ -357,12 +148,12 @@ def statuses_to_df(statuses) -> pd.DataFrame:
         x1, y1, x2, y2 = s.person.xyxy
         rows.append(
             {
-                "person_id": getattr(s, "person_id", i),
+                "person": i,
                 "status": "SAFE" if not s.violations else " + ".join(s.violations),
                 "helmet_ok": bool(s.helmet_ok),
                 "vest_ok": bool(s.vest_ok),
                 "person_conf": round(float(s.person.conf), 3),
-                "box": f"{int(x1)}, {int(y1)}, {int(x2)}, {int(y2)}",
+                "box_original": f"{int(x1)}, {int(y1)}, {int(x2)}, {int(y2)}",
             }
         )
     return pd.DataFrame(rows)
@@ -381,7 +172,6 @@ def build_json_result(detections, statuses, counts: dict[str, int]) -> str:
         ],
         "persons": [
             {
-                "person_id": getattr(s, "person_id", None),
                 "person_conf": float(s.person.conf),
                 "person_xyxy": [float(v) for v in s.person.xyxy],
                 "helmet_ok": bool(s.helmet_ok),
@@ -403,29 +193,8 @@ def encode_png(image_rgb: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
-def run_detection_on_bgr(
-    image_bgr: np.ndarray,
-    weights_path: str,
-    config_path: str,
-    conf: float,
-    iou: float,
-    device: str | None,
-):
-    detector = get_detector(weights_path, conf, iou, device)
-    cfg = safe_load_cfg(config_path)
-
-    detections = detector.predict_image(image_bgr)
-    statuses = analyze_ppe(detections, cfg)
-    counts = summary_counts(statuses)
-    annotated_bgr = draw_ppe_status(image_bgr, detections, statuses)
-    _draw_person_ids(annotated_bgr, statuses)
-
-    return annotated_bgr, detections, statuses, counts
-
-
 def show_summary_cards(counts: dict[str, int]) -> None:
     c1, c2, c3, c4, c5 = st.columns(5)
-
     with c1:
         st.metric("Persons", counts.get("persons", 0))
     with c2:
@@ -464,17 +233,26 @@ def process_uploaded_image(uploaded_file, weights_path: str, config_path: str, c
     image_rgb = np.array(image)
     image_bgr = rgb_to_bgr(image_rgb)
 
+    detector = get_detector(weights_path, conf, iou, device)
+    cfg = load_rules_config_safe(config_path)
+
     with st.spinner("Đang chạy YOLO trên ảnh..."):
         start = time.time()
-        annotated_bgr, detections, statuses, counts = run_detection_on_bgr(
-            image_bgr, weights_path, config_path, conf, iou, device
+        annotated_bgr, detections, statuses, counts = process_image_bgr(
+            detector,
+            image_bgr,
+            cfg,
+            use_canvas=True,
         )
         elapsed = time.time() - start
 
     annotated_rgb = bgr_to_rgb(annotated_bgr)
 
     show_summary_cards(counts)
-    st.caption(f"Thời gian xử lý: {elapsed:.2f}s | Detections: {len(detections)}")
+    st.caption(
+        f"Thời gian xử lý: {elapsed:.2f}s | Detections: {len(detections)} | "
+        f"Khung kết quả: {CANVAS_WIDTH}x{CANVAS_HEIGHT}"
+    )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -523,129 +301,55 @@ def process_video_file(
 
     output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        st.error("Không mở được video.")
-        return
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    if fps <= 1 or fps > 240:
-        fps = 25
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-
-    if w <= 0 or h <= 0:
-        st.error("Video lỗi kích thước frame.")
-        cap.release()
-        return
-
-    max_frames = total_frames
-    if max_seconds > 0:
-        max_frames = min(max_frames, int(max_seconds * fps)) if total_frames else int(max_seconds * fps)
-
-    writer = cv2.VideoWriter(
-        output_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps / max(1, frame_skip),
-        (w, h),
-    )
-
-    if not writer.isOpened():
-        st.error("Không tạo được file video output.")
-        cap.release()
-        return
+    detector = get_detector(weights_path, conf, iou, device)
 
     progress = st.progress(0)
     status_box = st.empty()
     preview_box = st.empty()
 
-    detector = get_detector(weights_path, conf, iou, device)
-    cfg = safe_load_cfg(config_path)
+    def progress_callback(progress_value, processed, frame_idx, total, counts):
+        progress.progress(progress_value)
+        status_box.write(
+            f"Đã xử lý {processed} frame | Frame gốc {frame_idx}/{total} | "
+            f"Persons: {counts.get('persons', 0)} | Unsafe: {counts.get('unsafe', 0)}"
+        )
 
-    frame_idx = 0
-    processed = 0
-    last_counts = {"persons": 0, "safe": 0, "unsafe": 0, "no_helmet": 0, "no_vest": 0}
-    max_counts = {"persons": 0, "safe": 0, "unsafe": 0, "no_helmet": 0, "no_vest": 0}
-    sum_counts = {"persons": 0, "safe": 0, "unsafe": 0, "no_helmet": 0, "no_vest": 0}
-
-    start = time.time()
+    def preview_callback(frame_bgr):
+        preview_box.image(bgr_to_rgb(frame_bgr), caption="Preview frame đang xử lý", use_container_width=True)
 
     with st.spinner("Đang xử lý video..."):
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        result = process_video_to_path(
+            detector=detector,
+            source=input_path,
+            out_path=output_path,
+            config_path=config_path,
+            max_seconds=max_seconds,
+            frame_skip=frame_skip,
+            fix_video=True,
+            progress_callback=progress_callback,
+            preview_callback=preview_callback,
+        )
 
-            if max_frames and frame_idx >= max_frames:
-                break
-
-            frame_idx += 1
-
-            if frame_idx % max(1, frame_skip) != 0:
-                continue
-
-            # Detection chính giữ nguyên logic cũ để không mất nhận diện person/helmet/vest.
-            detections = detector.predict_image(frame)
-            statuses = analyze_ppe(detections, cfg)
-
-            # Tracking chỉ lấy ID cho person, không thay thế detection.
-            person_tracks = _track_person_ids(detector, frame, tracker="bytetrack.yaml")
-            counts = summary_counts(statuses)
-            annotated = draw_ppe_status(frame, detections, statuses)
-            _draw_person_ids(annotated, statuses, person_tracks)
-
-            writer.write(annotated)
-
-            processed += 1
-            last_counts = counts
-
-            for k in max_counts:
-                max_counts[k] = max(max_counts[k], counts.get(k, 0))
-                sum_counts[k] += counts.get(k, 0)
-
-            if processed % 10 == 0:
-                preview_box.image(bgr_to_rgb(annotated), caption="Preview frame đang xử lý", use_container_width=True)
-
-            if max_frames:
-                progress.progress(min(frame_idx / max_frames, 1.0))
-
-            status_box.write(
-                f"Đã xử lý {processed} frame | Frame gốc {frame_idx}/{max_frames if max_frames else total_frames} | "
-                f"Persons: {counts.get('persons', 0)} | Unsafe: {counts.get('unsafe', 0)}"
-            )
-
-    cap.release()
-    writer.release()
-
-    elapsed = time.time() - start
-
-    if processed == 0:
+    if result["processed_frames"] == 0:
         st.warning("Không xử lý được frame nào.")
         return
 
-    avg_counts = {k: round(v / processed, 2) for k, v in sum_counts.items()}
-
-    st.success(f"Xử lý xong video trong {elapsed:.1f}s. Processed frames: {processed}")
+    st.success(f"Xử lý xong video trong {result['elapsed']:.1f}s. Processed frames: {result['processed_frames']}")
 
     st.subheader("Thống kê video")
     c1, c2, c3 = st.columns(3)
-
     with c1:
         st.write("Frame cuối")
-        show_summary_cards(last_counts)
-
+        show_summary_cards(result["last_counts"])
     with c2:
         st.write("Max trong video")
-        st.json(max_counts)
-
+        st.json(result["max_counts"])
     with c3:
         st.write("Trung bình/frame")
-        st.json(avg_counts)
+        st.json(result["avg_counts"])
 
-    st.subheader("Video kết quả")
-    video_bytes = read_file_bytes(output_path)
+    st.subheader(f"Video kết quả ({CANVAS_WIDTH}x{CANVAS_HEIGHT})")
+    video_bytes = read_file_bytes(result["output_path"])
     st.video(video_bytes)
 
     st.download_button(
@@ -737,19 +441,11 @@ if not Path(config_path).exists():
 # MAIN TABS
 # =========================
 
-tab_img, tab_video, tab_cam, tab_help = st.tabs(
-    ["Ảnh", "Video", "Webcam", "Giải thích"]
-)
-
+tab_img, tab_video, tab_cam, tab_help = st.tabs(["Ảnh", "Video", "Webcam", "Giải thích"])
 
 with tab_img:
     st.subheader("Nhận diện trên ảnh")
-
-    uploaded_img = st.file_uploader(
-        "Upload ảnh công trường",
-        type=IMAGE_TYPES,
-        key="image_uploader",
-    )
+    uploaded_img = st.file_uploader("Upload ảnh công trường", type=IMAGE_TYPES, key="image_uploader")
 
     if uploaded_img is None:
         st.info("Upload ảnh `.jpg`, `.png`, `.webp` để chạy demo.")
@@ -759,15 +455,9 @@ with tab_img:
         except Exception as exc:
             st.error(f"Lỗi khi xử lý ảnh: {exc}")
 
-
 with tab_video:
     st.subheader("Nhận diện trên video")
-
-    uploaded_video = st.file_uploader(
-        "Upload video",
-        type=VIDEO_TYPES,
-        key="video_uploader",
-    )
+    uploaded_video = st.file_uploader("Upload video", type=VIDEO_TYPES, key="video_uploader")
 
     if uploaded_video is None:
         st.info("Upload video `.mp4`, `.avi`, `.mov`, `.mkv`, `.webm` để chạy demo.")
@@ -788,10 +478,8 @@ with tab_video:
             except Exception as exc:
                 st.error(f"Lỗi khi xử lý video: {exc}")
 
-
 with tab_cam:
     st.subheader("Chụp ảnh từ webcam")
-
     captured = st.camera_input("Chụp một ảnh từ webcam")
 
     if captured is not None:
@@ -800,13 +488,28 @@ with tab_cam:
         except Exception as exc:
             st.error(f"Lỗi khi xử lý ảnh webcam: {exc}")
 
-
 with tab_help:
     st.subheader("Cách hiểu kết quả")
-
     st.markdown(
-        """
-### 1. Class và trạng thái khác nhau
+        f"""
+### 1. File nào xử lý AI?
+
+App Streamlit hiện tại chỉ làm giao diện: upload ảnh/video, hiển thị kết quả, bảng thống kê và nút tải file.
+
+Toàn bộ xử lý AI chính nằm trong `detect.py`, gồm:
+
+- Load YOLO model
+- Detect ảnh/frame
+- Suy luận SAFE / NO_HELMET / NO_VEST
+- Vẽ bounding box
+- Ép kết quả vào khung cố định `{CANVAS_WIDTH}x{CANVAS_HEIGHT}`
+- Xử lý video output
+
+Vì vậy sửa logic detect thì sửa trong `detect.py`.
+
+---
+
+### 2. Class và trạng thái khác nhau
 
 **Class YOLO detect trực tiếp:**
 
@@ -826,7 +529,7 @@ with tab_help:
 
 ---
 
-### 2. Confidence là gì?
+### 3. Confidence là gì?
 
 `conf` là độ tự tin tối thiểu để giữ lại một detection.
 
@@ -837,7 +540,7 @@ Demo PPE nên thử từ `0.05` đến `0.25`.
 
 ---
 
-### 3. IoU là gì?
+### 4. IoU là gì?
 
 `IoU` dùng để lọc các box trùng nhau.
 
@@ -848,9 +551,10 @@ Thường để `0.45–0.50`.
 
 ---
 
-### 4. Code hiện tại có tracking chưa?
+### 5. Code hiện tại có tracking thật chưa?
 
-Có. Với video, app dùng ByteTrack thông qua `model.track(..., persist=True, tracker="bytetrack.yaml")` để gán ID cho từng người qua nhiều frame.
-Với ảnh tĩnh hoặc ảnh chụp webcam, không có chuỗi thời gian nên app chỉ đánh số tạm `ID 1`, `ID 2`, ... cho các person trong ảnh.
+Không dùng tracking thật để tránh làm giảm/mất detection.
+
+Bản này ưu tiên nhận diện PPE ổn định. Nếu cần tracking thật, nên thêm sau và kiểm thử riêng.
 """
     )
