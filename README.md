@@ -18,7 +18,7 @@ Mục tiêu của project là hỗ trợ giám sát an toàn lao động trong m
 ## Thành viên nhóm
 
 | STT | Họ và tên | MSV | Đóng góp |
-|---|---|---|---|---|
+|---|---|---|---|
 | 1 | Phạm Đức Anh | 23001578 | 25% |
 | 2 | Đặng Tùng Anh | 23001574 | 25% |
 | 3 | Nguyễn Hà Gia Bảo | 23001581 | 25% |
