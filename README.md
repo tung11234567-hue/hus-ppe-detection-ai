@@ -17,12 +17,12 @@ Mục tiêu của project là hỗ trợ giám sát an toàn lao động trong m
 
 ## Thành viên nhóm
 
-| STT | Họ và tên | MSV | Công việc | Đóng góp |
+| STT | Họ và tên | MSV | Đóng góp |
 |---|---|---|---|---|
-| 1 | Phạm Đức Anh | 23001578 | Viết báo cáo, làm slide | 25% |
-| 2 | Đặng Tùng Anh | 23001574 | Hỗ trợ code, train AI | 25% |
-| 3 | Nguyễn Hà Gia Bảo | 23001581 | Thiết kế code, thuyết trình | 25% |
-| 4 | Vũ Việt Anh | 23001579 | Viết báo cáo, làm slide | 25% |
+| 1 | Phạm Đức Anh | 23001578 | 25% |
+| 2 | Đặng Tùng Anh | 23001574 | 25% |
+| 3 | Nguyễn Hà Gia Bảo | 23001581 | 25% |
+| 4 | Vũ Việt Anh | 23001579 | 25% |
 
 ## Bài toán
 
